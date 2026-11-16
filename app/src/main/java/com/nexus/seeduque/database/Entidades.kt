@@ -1,6 +1,7 @@
 package com.nexus.seeduque.database
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 import java.util.UUID
 
@@ -15,7 +16,10 @@ data class Area(
     val alteradoEm: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "projetos")
+@Entity(
+    tableName = "projetos",
+    indices = [Index(value = ["areaId"]), Index(value = ["estado"])]
+)
 data class Projeto(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),
     val nome: String,
@@ -24,12 +28,19 @@ data class Projeto(
     val dataAlvo: String? = null, // Formato YYYY-MM-DD
     val linkExterno: String? = null,
     val estado: String = "Ativo", // Ativo, Pausado, Concluído
+    val tipoProjeto: String = "TAREFAS", // TAREFAS, LIVRO, IDIOMA, DISCIPLINA
+    val unidadeMedida: String = "tarefas",
+    val valorAtual: Int = 0,
+    val valorTotal: Int = 0,
     val arquivado: Boolean = false,
     val criadoEm: Long = System.currentTimeMillis(),
     val alteradoEm: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "tarefas")
+@Entity(
+    tableName = "tarefas",
+    indices = [Index(value = ["projetoId", "estado"])]
+)
 data class Tarefa(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),
     val titulo: String,
@@ -75,7 +86,14 @@ data class Marco(
     val criadoEm: Long = System.currentTimeMillis()
 )
 
-@Entity(tableName = "dependencias")
+@Entity(
+    tableName = "dependencias",
+    indices = [
+        Index(value = ["predecessoraId", "sucessoraId"], unique = true),
+        Index(value = ["predecessoraId"]),
+        Index(value = ["sucessoraId"])
+    ]
+)
 data class Dependencia(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),
     val predecessoraId: String,
@@ -95,7 +113,10 @@ data class Disponibilidade(
     val validoAte: String? = null  // Exceção temporal YYYY-MM-DD
 )
 
-@Entity(tableName = "sessoes")
+@Entity(
+    tableName = "sessoes",
+    indices = [Index(value = ["inicioMs"])]
+)
 data class Sessao(
     @PrimaryKey val id: String = UUID.randomUUID().toString(),
     val tarefaId: String? = null,

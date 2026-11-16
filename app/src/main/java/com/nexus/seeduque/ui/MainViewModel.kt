@@ -64,10 +64,19 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     val areas: StateFlow<List<Area>> = repository.observarAreas()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val areasArquivadas: StateFlow<List<Area>> = repository.observarAreasArquivadas()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val todosProjetos = repository.observarProjetos()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val projetosArquivados: StateFlow<List<Projeto>> = repository.observarProjetosArquivados()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val todasTarefas = repository.observarTarefas()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val tarefasArquivadas: StateFlow<List<Tarefa>> = repository.observarTarefasArquivadas()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val todosObjetivos = repository.observarObjetivos()
@@ -102,6 +111,10 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
             tasks.filter { it.projetoId != null && idsPermitidos.contains(it.projetoId) }
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val qtdTarefasSemProjeto: StateFlow<Int> = todasTarefas.map { list ->
+        list.count { it.projetoId.isNullOrBlank() && it.estado != "Concluída" }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     val objetivos: StateFlow<List<Objetivo>> = combine(todosObjetivos, projetos, _areaFiltroId) { goals, projsFiltrados, areaId ->
         if (areaId.isNullOrBlank()) goals
@@ -140,6 +153,15 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     }
 
     fun hojeIso(): String = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+
+    fun fimDeHojeMs(): Long {
+        val cal = Calendar.getInstance()
+        cal.set(Calendar.HOUR_OF_DAY, 23)
+        cal.set(Calendar.MINUTE, 59)
+        cal.set(Calendar.SECOND, 59)
+        cal.set(Calendar.MILLISECOND, 999)
+        return cal.timeInMillis
+    }
 
     // =========================================================================
     // MOTOR ANALÍTICO NÍVEL 2: BLOQUEIOS, GARGALOS E CAMINHO CRÍTICO
@@ -291,7 +313,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         val agora = System.currentTimeMillis()
         val fim7Dias = agora + (7L * 24L * 3600L * 1000L)
         val minSessoes7d = listaSessoes
-            .filter { it.inicioMs in agora..fim7Dias }
+            .filter { it.estado != "Concluída" && it.fimMs >= agora && it.inicioMs <= fim7Dias }
             .sumOf { it.duracaoMinutos }
 
         val hPlan = ((minSessoes7d / 60.0) * 10.0).roundToInt() / 10.0
@@ -387,6 +409,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                 val dIso = sdf.format(cursor.time)
                 val diaZeroASeis = cursor.get(Calendar.DAY_OF_WEEK) - 1
                 val capLiquida = minutosDisponiveisNaData(dIso, diaZeroASeis, listaDisp) * (1.0 - buffer)
+
                 if (capLiquida > 0) queima -= capLiquida
                 if (queima > 0) {
                     cursor.add(Calendar.DAY_OF_YEAR, 1)
@@ -419,10 +442,13 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     }
 
     // =========================================================================
-    // CRONÓMETRO DE FOCO INTEGRADO
+    // CRONÓMETRO DE FOCO INTEGRADO (ATÔMICO E SEGURO)
     // =========================================================================
 
     fun iniciarFoco(tarefa: Tarefa) {
+        if (_tarefaEmFoco.value != null && _tarefaEmFoco.value?.id != tarefa.id) {
+            pararFoco(salvarTempo = true, concluirTarefa = false)
+        }
         timerJob?.cancel()
         inicioFocoMs = System.currentTimeMillis()
         _tarefaEmFoco.value = tarefa
@@ -450,24 +476,16 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         _segundosFoco.value = 0L
 
         if (!salvarTempo || tarefa == null) {
-            emitirToast("Cronómetro cancelado.")
+            emitirToast("Cronômetro cancelado.")
             return
         }
 
         val minutosGastos = max(1, (segs / 60.0).roundToInt())
-        val novoTotalReal = tarefa.minutosReais + minutosGastos
         val novoEstado = if (concluirTarefa) "Concluída" else "Em andamento"
         val agora = System.currentTimeMillis()
 
         viewModelScope.launch {
-            repository.atualizarTarefa(
-                tarefa.copy(
-                    estado = novoEstado,
-                    minutosReais = novoTotalReal,
-                    alteradoEm = agora,
-                    concluidaEm = if (concluirTarefa) agora else tarefa.concluidaEm
-                )
-            )
+            repository.somarMinutosTarefaAtomico(tarefa.id, minutosGastos, novoEstado)
             repository.inserirSessao(
                 Sessao(
                     tarefaId = tarefa.id,
@@ -479,12 +497,21 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                     estado = "Concluída"
                 )
             )
-            emitirToast("✓ +${minutosGastos}m gravados em '${tarefa.titulo}' (K_calib atualizado)")
+            emitirToast("✓ +${minutosGastos}m gravados em '${tarefa.titulo}'")
+        }
+    }
+
+    private fun cancelarFocoSeMesmaTarefa(tarefaId: String) {
+        if (_tarefaEmFoco.value?.id == tarefaId) {
+            timerJob?.cancel()
+            timerJob = null
+            _tarefaEmFoco.value = null
+            _segundosFoco.value = 0L
         }
     }
 
     // =========================================================================
-    // CRUD COMPLETO COM VALIDAÇÕES DE NÍVEL 2
+    // CRUD COMPLETO COM REGRAS HONESTAS E VALIDAÇÕES
     // =========================================================================
 
     fun criarTarefaCompleta(
@@ -508,7 +535,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                     prazoData = prazoData?.takeIf { it.isNotBlank() }
                 )
             )
-            emitirToast("✓ Tarefa adicionada à fila!")
+            emitirToast("✓ Tarefa salva!")
         }
     }
 
@@ -523,6 +550,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         novoEstado: String
     ) {
         if (novoTitulo.isBlank()) return
+        if (novoEstado == "Concluída") cancelarFocoSeMesmaTarefa(tarefa.id)
         val agora = System.currentTimeMillis()
         viewModelScope.launch {
             repository.atualizarTarefa(
@@ -560,6 +588,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     }
 
     fun concluirTarefaComCalibracao(tarefa: Tarefa, minutosReaisExecutados: Int) {
+        cancelarFocoSeMesmaTarefa(tarefa.id)
         val agora = System.currentTimeMillis()
         viewModelScope.launch {
             repository.atualizarTarefa(
@@ -570,11 +599,12 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                     concluidaEm = agora
                 )
             )
-            emitirToast("✓ Tarefa concluída e K_calib atualizado!")
+            emitirToast("✓ Tarefa concluída!")
         }
     }
 
     fun atualizarEstadoTarefa(tarefa: Tarefa, novoEstado: String) {
+        if (novoEstado == "Concluída") cancelarFocoSeMesmaTarefa(tarefa.id)
         val agora = System.currentTimeMillis()
         viewModelScope.launch {
             val concluidaEm = if (novoEstado == "Concluída") agora else null
@@ -593,9 +623,17 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     }
 
     fun arquivarTarefa(tarefa: Tarefa) {
+        cancelarFocoSeMesmaTarefa(tarefa.id)
         viewModelScope.launch {
             repository.atualizarTarefa(tarefa.copy(arquivada = true, alteradoEm = System.currentTimeMillis()))
             emitirToast("Tarefa arquivada.")
+        }
+    }
+
+    fun desarquivarTarefa(tarefa: Tarefa) {
+        viewModelScope.launch {
+            repository.atualizarTarefa(tarefa.copy(arquivada = false, alteradoEm = System.currentTimeMillis()))
+            emitirToast("✓ Tarefa restaurada.")
         }
     }
 
@@ -609,24 +647,86 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
 
     fun arquivarArea(area: Area) {
         viewModelScope.launch {
-            repository.atualizarArea(area.copy(status = "Arquivada"))
+            repository.atualizarArea(area.copy(status = "Arquivada", alteradoEm = System.currentTimeMillis()))
             if (_areaFiltroId.value == area.id) _areaFiltroId.value = null
             emitirToast("Área arquivada.")
         }
     }
 
-    fun criarProjeto(nome: String, areaId: String?, objetivo: String, dataAlvo: String?) {
+    fun editarArea(area: Area, novoNome: String, novaDesc: String, novaCor: String) {
+        if (novoNome.isBlank()) return
+        viewModelScope.launch {
+            repository.atualizarArea(
+                area.copy(
+                    nome = novoNome.trim(),
+                    descricao = novaDesc.trim(),
+                    cor = novaCor.ifBlank { "#00F0FF" },
+                    alteradoEm = System.currentTimeMillis()
+                )
+            )
+            emitirToast("✓ Área atualizada!")
+        }
+    }
+
+    fun desarquivarArea(area: Area) {
+        viewModelScope.launch {
+            repository.atualizarArea(area.copy(status = "Ativa", alteradoEm = System.currentTimeMillis()))
+            emitirToast("✓ Área restaurada!")
+        }
+    }
+
+    fun atualizarMetadadosProgressoProjeto(
+        projeto: Projeto,
+        tipoProjeto: String,
+        unidadeMedida: String,
+        valorAtual: Int,
+        valorTotal: Int
+    ) {
+        viewModelScope.launch {
+            repository.atualizarProjeto(
+                projeto.copy(
+                    tipoProjeto = tipoProjeto,
+                    unidadeMedida = unidadeMedida,
+                    valorAtual = max(0, valorAtual),
+                    valorTotal = max(0, valorTotal),
+                    alteradoEm = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    fun criarProjeto(
+        nome: String,
+        areaId: String?,
+        objetivo: String,
+        dataAlvo: String?,
+        tipoProjeto: String = "TAREFAS",
+        unidadeMedida: String = "tarefas",
+        valorTotal: Int = 0
+    ) {
         if (nome.isBlank()) return
+        val areaEfetiva = areaId?.takeIf { it.isNotBlank() } ?: _areaFiltroId.value
         viewModelScope.launch {
             repository.inserirProjeto(
                 Projeto(
                     nome = nome.trim(),
-                    areaId = areaId?.takeIf { it.isNotBlank() },
+                    areaId = areaEfetiva,
                     objetivo = objetivo.trim(),
-                    dataAlvo = dataAlvo?.takeIf { it.isNotBlank() }
+                    dataAlvo = dataAlvo?.takeIf { it.isNotBlank() },
+                    tipoProjeto = tipoProjeto,
+                    unidadeMedida = unidadeMedida,
+                    valorTotal = max(0, valorTotal)
                 )
             )
             emitirToast("✓ Projeto '$nome' criado!")
+        }
+    }
+
+    fun registrarProgressoProjeto(projeto: Projeto, delta: Int) {
+        val novoValor = max(0, projeto.valorAtual + delta)
+        viewModelScope.launch {
+            repository.atualizarProgressoProjeto(projeto.id, novoValor)
+            emitirToast("✓ +$delta ${projeto.unidadeMedida} em '${projeto.nome}'")
         }
     }
 
@@ -656,8 +756,15 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
 
     fun arquivarProjeto(projeto: Projeto) {
         viewModelScope.launch {
-            repository.atualizarProjeto(projeto.copy(arquivado = true))
+            repository.atualizarProjeto(projeto.copy(arquivado = true, alteradoEm = System.currentTimeMillis()))
             emitirToast("Projeto arquivado.")
+        }
+    }
+
+    fun desarquivarProjeto(projeto: Projeto) {
+        viewModelScope.launch {
+            repository.atualizarProjeto(projeto.copy(arquivado = false, alteradoEm = System.currentTimeMillis()))
+            emitirToast("✓ Projeto restaurado.")
         }
     }
 
@@ -781,17 +888,21 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         }
     }
 
-    fun criarSessao(titulo: String, duracaoMinutos: Int = 60, tarefaId: String? = null) {
+    fun criarSessao(
+        titulo: String,
+        duracaoMinutos: Int = 60,
+        tarefaId: String? = null,
+        inicioPersonalizadoMs: Long? = null
+    ) {
         if (titulo.isBlank()) {
             emitirToast("Informe o título da sessão.")
             return
         }
-        val agora = System.currentTimeMillis()
-        val fim = agora + (max(15, duracaoMinutos) * 60_000L)
+        val inicio = inicioPersonalizadoMs ?: System.currentTimeMillis()
+        val fim = inicio + (max(15, duracaoMinutos) * 60_000L)
 
-        // Verifica colisão de horário com sessões planejadas ativas
         val conflito = sessoes.value.find { s ->
-            s.estado != "Concluída" && agora < s.fimMs && fim > s.inicioMs
+            s.estado != "Concluída" && inicio < s.fimMs && fim > s.inicioMs
         }
 
         val projId = tarefas.value.find { it.id == tarefaId }?.projetoId
@@ -801,7 +912,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                     tarefaId = tarefaId,
                     projetoId = projId,
                     titulo = titulo.trim(),
-                    inicioMs = agora,
+                    inicioMs = inicio,
                     fimMs = fim,
                     duracaoMinutos = max(15, duracaoMinutos)
                 )
@@ -822,7 +933,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         }
     }
 
-    fun criarRevisao(titulo: String, regraIntervalo: String = "D+7", observacoes: String = "") {
+    fun criarRevisao(titulo: String, regraIntervalo: String = "D+7", observacoes: String = "", dataPersonalizadaMs: Long? = null) {
         if (titulo.isBlank()) return
         val diasOffset = when (regraIntervalo) {
             "D+1" -> 1
@@ -830,7 +941,7 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
             "D+15" -> 15
             else -> 7
         }
-        val dataAlvoMs = System.currentTimeMillis() + (diasOffset * 86_400_000L)
+        val dataAlvoMs = dataPersonalizadaMs ?: (System.currentTimeMillis() + (diasOffset * 86_400_000L))
         viewModelScope.launch {
             repository.inserirRevisao(
                 Revisao(
@@ -840,22 +951,18 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                     dataAgendada = dataAlvoMs
                 )
             )
-            emitirToast("✓ Revisão agendada para $regraIntervalo!")
+            emitirToast("✓ Revisão agendada!")
         }
     }
 
-    /**
-     * Conclui a revisão e propaga automaticamente o próximo ciclo de repetição espaçada:
-     * D+1 -> D+3 -> D+7 -> D+15
-     */
-    fun concluirRevisao(revisao: Revisao) {
+    fun concluirRevisao(revisao: Revisao, agendarProximoCiclo: Boolean = true) {
         val concluindo = revisao.estado != "Concluída"
         val novoEstado = if (concluindo) "Concluída" else "Pendente"
 
         viewModelScope.launch {
             repository.atualizarRevisao(revisao.copy(estado = novoEstado))
 
-            if (concluindo) {
+            if (concluindo && agendarProximoCiclo) {
                 val proximoCiclo = when (revisao.regraIntervalo) {
                     "D+1" -> "D+3" to 3
                     "D+3" -> "D+7" to 7
@@ -876,10 +983,12 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                             estado = "Pendente"
                         )
                     )
-                    emitirToast("✓ Revisão concluída! Próximo ciclo ($novaRegra) agendado automaticamente.")
+                    emitirToast("✓ Revisão concluída e próximo ciclo ($novaRegra) agendado.")
                 } else {
-                    emitirToast("✓ Ciclo completo de revisões concluído!")
+                    emitirToast("✓ Ciclo de revisões concluído!")
                 }
+            } else if (concluindo) {
+                emitirToast("✓ Revisão concluída.")
             } else {
                 emitirToast("Revisão reaberta.")
             }
@@ -906,12 +1015,18 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
                 putExtra(CalendarContract.Events.TITLE, "[Se Eduque] ${sessao.titulo}")
                 putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, sessao.inicioMs)
                 putExtra(CalendarContract.EXTRA_EVENT_END_TIME, sessao.fimMs)
-                putExtra(CalendarContract.Events.DESCRIPTION, "Sessão de Foco gerada pelo Se Eduque Nível 2")
+                putExtra(CalendarContract.Events.DESCRIPTION, "Sessão de Foco gerada pelo Se Eduque")
             }
             context.startActivity(intent)
-            viewModelScope.launch { repository.atualizarSessao(sessao.copy(sincronizadoCalendar = true)) }
+            emitirToast("📅 Formulário aberto no Calendar. Confirme lá para salvar.")
         } catch (e: Exception) {
-            emitirToast("Não foi possível abrir a aplicação de Calendário.")
+            emitirToast("Não foi possível abrir o app de Calendário.")
+        }
+    }
+
+    fun marcarSessaoSincronizada(sessao: Sessao, sincronizada: Boolean) {
+        viewModelScope.launch {
+            repository.atualizarSessao(sessao.copy(sincronizadoCalendar = sincronizada))
         }
     }
 
@@ -929,12 +1044,12 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
         }
     }
 
-    fun restaurarBackupLocal(context: Context, uri: Uri) {
+    fun restaurarBackupLocal(context: Context, uri: Uri, substituirTudo: Boolean = true) {
         viewModelScope.launch {
             try {
                 val jsonStr = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
                 if (!jsonStr.isNullOrBlank()) {
-                    val qtd = repository.restaurarDadosBackup(jsonStr)
+                    val qtd = repository.restaurarDadosBackup(jsonStr, substituirTudo)
                     emitirToast("✓ Backup restaurado ($qtd registos importados)!")
                 }
             } catch (e: Exception) {
@@ -946,14 +1061,14 @@ class MainViewModel(private val repository: SeEduqueRepository) : ViewModel() {
     fun injetarMassaDeTeste() {
         viewModelScope.launch {
             repository.gerarCenarioTesteNivel2()
-            emitirToast("🧪 Cenário de Teste Nível 2 gerado! Verifique Kanban e Previsões.")
+            emitirToast("🧪 Cenário de Teste gerado! Verifique Kanban e Previsões.")
         }
     }
 
     fun limparMassaDeTeste() {
         viewModelScope.launch {
             repository.limparCenarioTesteNivel2()
-            emitirToast("🧹 Massa de teste removida com sucesso!")
+            emitirToast("🧹 Massa de teste removida do banco!")
         }
     }
 }

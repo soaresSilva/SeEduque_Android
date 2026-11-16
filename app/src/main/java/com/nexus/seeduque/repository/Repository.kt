@@ -7,8 +7,11 @@ import org.json.JSONObject
 
 class SeEduqueRepository(private val dao: SeEduqueDao) {
     fun observarAreas(): Flow<List<Area>> = dao.observarAreas()
+    fun observarAreasArquivadas(): Flow<List<Area>> = dao.observarAreasArquivadas()
     fun observarProjetos(): Flow<List<Projeto>> = dao.observarProjetos()
+    fun observarProjetosArquivados(): Flow<List<Projeto>> = dao.observarProjetosArquivados()
     fun observarTarefas(): Flow<List<Tarefa>> = dao.observarTarefas()
+    fun observarTarefasArquivadas(): Flow<List<Tarefa>> = dao.observarTarefasArquivadas()
     fun observarObjetivos(): Flow<List<Objetivo>> = dao.observarObjetivos()
     fun observarMarcos(): Flow<List<Marco>> = dao.observarMarcos()
     fun observarDependencias(): Flow<List<Dependencia>> = dao.observarDependencias()
@@ -22,9 +25,13 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
 
     suspend fun inserirProjeto(projeto: Projeto) = dao.inserirProjeto(projeto)
     suspend fun atualizarProjeto(projeto: Projeto) = dao.atualizarProjeto(projeto)
+    suspend fun atualizarProgressoProjeto(projetoId: String, novoValor: Int) =
+        dao.atualizarProgressoProjetoAtomico(projetoId, novoValor, System.currentTimeMillis())
 
     suspend fun inserirTarefa(tarefa: Tarefa) = dao.inserirTarefa(tarefa)
     suspend fun atualizarTarefa(tarefa: Tarefa) = dao.atualizarTarefa(tarefa)
+    suspend fun somarMinutosTarefaAtomico(tarefaId: String, minutos: Int, estado: String) =
+        dao.somarMinutosTarefaAtomico(tarefaId, minutos, estado, System.currentTimeMillis())
 
     suspend fun inserirObjetivo(objetivo: Objetivo) = dao.inserirObjetivo(objetivo)
     suspend fun atualizarObjetivo(objetivo: Objetivo) = dao.atualizarObjetivo(objetivo)
@@ -47,10 +54,6 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
 
     suspend fun inserirRetrospectiva(retro: Retrospectiva) = dao.inserirRetrospectiva(retro)
 
-    /**
-     * Garante que as Áreas padrão (Universidade, Programação, Inglês, Livros)
-     * e a Disponibilidade Semanal Base existem na primeira execução.
-     */
     suspend fun garantirDadosIniciais() {
         if (dao.getTodasAreas().isEmpty()) {
             dao.inserirArea(Area(nome = "Universidade", descricao = "Disciplinas, aulas, entregas e provas", cor = "#FF0055"))
@@ -72,13 +75,10 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
         }
     }
 
-    /**
-     * Exportação Portátil Completa das 10 Tabelas em JSON
-     */
     suspend fun getDadosBackup(): String {
         val root = JSONObject()
         root.put("appName", "Se Eduque Android Nível 2")
-        root.put("version", 5)
+        root.put("version", 6)
         root.put("exportedAt", System.currentTimeMillis())
 
         root.put("areas", JSONArray().apply {
@@ -97,6 +97,8 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                     put("id", p.id); put("nome", p.nome); put("areaId", p.areaId ?: "")
                     put("objetivo", p.objetivo ?: ""); put("dataAlvo", p.dataAlvo ?: "")
                     put("linkExterno", p.linkExterno ?: ""); put("estado", p.estado)
+                    put("tipoProjeto", p.tipoProjeto); put("unidadeMedida", p.unidadeMedida)
+                    put("valorAtual", p.valorAtual); put("valorTotal", p.valorTotal)
                     put("arquivado", p.arquivado); put("criadoEm", p.criadoEm); put("alteradoEm", p.alteradoEm)
                 })
             }
@@ -194,17 +196,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
         return root.toString(2)
     }
 
-    /**
-     * Restauração / Importação Completa de Backup JSON (Todas as 10 Tabelas)
-     */
-    suspend fun restaurarDadosBackup(jsonStr: String): Int {
+    suspend fun restaurarDadosBackup(jsonStr: String, substituirTudo: Boolean = true): Int {
         val root = JSONObject(jsonStr)
-        var totalImportado = 0
 
+        val areas = mutableListOf<Area>()
         root.optJSONArray("areas")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirArea(
+                areas.add(
                     Area(
                         id = o.getString("id"),
                         nome = o.getString("nome"),
@@ -215,14 +214,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         alteradoEm = o.optLong("alteradoEm", System.currentTimeMillis())
                     )
                 )
-                totalImportado++
             }
         }
 
+        val projetos = mutableListOf<Projeto>()
         root.optJSONArray("projetos")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirProjeto(
+                projetos.add(
                     Projeto(
                         id = o.getString("id"),
                         nome = o.getString("nome"),
@@ -231,20 +230,24 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         dataAlvo = o.optString("dataAlvo").takeIf { it.isNotBlank() },
                         linkExterno = o.optString("linkExterno").takeIf { it.isNotBlank() },
                         estado = o.optString("estado", "Ativo"),
+                        tipoProjeto = o.optString("tipoProjeto", "TAREFAS"),
+                        unidadeMedida = o.optString("unidadeMedida", "tarefas"),
+                        valorAtual = o.optInt("valorAtual", 0),
+                        valorTotal = o.optInt("valorTotal", 0),
                         arquivado = o.optBoolean("arquivado", false),
                         criadoEm = o.optLong("criadoEm", System.currentTimeMillis()),
                         alteradoEm = o.optLong("alteradoEm", System.currentTimeMillis())
                     )
                 )
-                totalImportado++
             }
         }
 
+        val tarefas = mutableListOf<Tarefa>()
         root.optJSONArray("tarefas")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
                 val conc = o.optLong("concluidaEm", 0L)
-                dao.inserirTarefa(
+                tarefas.add(
                     Tarefa(
                         id = o.getString("id"),
                         titulo = o.getString("titulo"),
@@ -264,14 +267,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         concluidaEm = if (conc > 0L) conc else null
                     )
                 )
-                totalImportado++
             }
         }
 
+        val objetivos = mutableListOf<Objetivo>()
         root.optJSONArray("objetivos")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirObjetivo(
+                objetivos.add(
                     Objetivo(
                         id = o.getString("id"),
                         titulo = o.getString("titulo"),
@@ -285,14 +288,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         criadoEm = o.optLong("criadoEm", System.currentTimeMillis())
                     )
                 )
-                totalImportado++
             }
         }
 
+        val marcos = mutableListOf<Marco>()
         root.optJSONArray("marcos")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirMarco(
+                marcos.add(
                     Marco(
                         id = o.getString("id"),
                         projetoId = o.optString("projetoId").takeIf { it.isNotBlank() },
@@ -304,14 +307,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         criadoEm = o.optLong("criadoEm", System.currentTimeMillis())
                     )
                 )
-                totalImportado++
             }
         }
 
+        val dependencias = mutableListOf<Dependencia>()
         root.optJSONArray("dependencias")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirDependencia(
+                dependencias.add(
                     Dependencia(
                         id = o.getString("id"),
                         predecessoraId = o.getString("predecessoraId"),
@@ -319,14 +322,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         notas = o.optString("notas").takeIf { it.isNotBlank() }
                     )
                 )
-                totalImportado++
             }
         }
 
+        val disponibilidade = mutableListOf<Disponibilidade>()
         root.optJSONArray("disponibilidade")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirDisponibilidade(
+                disponibilidade.add(
                     Disponibilidade(
                         id = o.getString("id"),
                         diaSemana = o.optInt("diaSemana", 1),
@@ -337,14 +340,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         validoAte = o.optString("validoAte").takeIf { it.isNotBlank() }
                     )
                 )
-                totalImportado++
             }
         }
 
+        val sessoes = mutableListOf<Sessao>()
         root.optJSONArray("sessoes")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirSessao(
+                sessoes.add(
                     Sessao(
                         id = o.getString("id"),
                         tarefaId = o.optString("tarefaId").takeIf { it.isNotBlank() },
@@ -357,14 +360,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         sincronizadoCalendar = o.optBoolean("sincronizadoCalendar", false)
                     )
                 )
-                totalImportado++
             }
         }
 
+        val revisoes = mutableListOf<Revisao>()
         root.optJSONArray("revisoes")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirRevisao(
+                revisoes.add(
                     Revisao(
                         id = o.getString("id"),
                         titulo = o.getString("titulo"),
@@ -377,14 +380,14 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         arquivada = o.optBoolean("arquivada", false)
                     )
                 )
-                totalImportado++
             }
         }
 
+        val retrospectivas = mutableListOf<Retrospectiva>()
         root.optJSONArray("retrospectivas")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                dao.inserirRetrospectiva(
+                retrospectivas.add(
                     Retrospectiva(
                         id = o.getString("id"),
                         dataMs = o.optLong("dataMs", System.currentTimeMillis()),
@@ -393,16 +396,19 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
                         oQueMudar = o.optString("oQueMudar", "")
                     )
                 )
-                totalImportado++
             }
         }
 
-        return totalImportado
+        if (substituirTudo) {
+            dao.substituirBancoCompleto(areas, projetos, tarefas, objetivos, marcos, dependencias, disponibilidade, sessoes, revisoes, retrospectivas)
+        } else {
+            dao.mesclarBancoCompleto(areas, projetos, tarefas, objetivos, marcos, dependencias, disponibilidade, sessoes, revisoes, retrospectivas)
+        }
+
+        return areas.size + projetos.size + tarefas.size + objetivos.size + marcos.size +
+                dependencias.size + disponibilidade.size + sessoes.size + revisoes.size + retrospectivas.size
     }
 
-    /**
-     * Gera um cenário de teste Nível 2 completo (Caminho Crítico, Gargalo, K_calib e Fantasma)
-     */
     suspend fun gerarCenarioTesteNivel2() {
         val areaProg = dao.getTodasAreas().find { it.nome.contains("Programação", ignoreCase = true) }
             ?: dao.getTodasAreas().firstOrNull()
@@ -508,12 +514,8 @@ class SeEduqueRepository(private val dao: SeEduqueDao) {
     }
 
     suspend fun limparCenarioTesteNivel2() {
-        listOf("dep_teste_1", "dep_teste_2", "dep_teste_3").forEach { dao.removerDependencia(it) }
-        dao.getTodasTarefas().filter { it.id.startsWith("t_teste_") || it.titulo.startsWith("[TESTE]") }.forEach {
-            dao.atualizarTarefa(it.copy(arquivada = true))
-        }
-        dao.getTodosProjetos().filter { it.id == "proj_teste_nivel2" || it.nome.startsWith("[TESTE]") }.forEach {
-            dao.atualizarProjeto(it.copy(arquivado = true))
-        }
+        dao.deletarDependenciasTeste()
+        dao.deletarTarefasTeste()
+        dao.deletarProjetosTeste()
     }
 }
